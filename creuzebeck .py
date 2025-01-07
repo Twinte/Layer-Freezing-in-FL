@@ -16,12 +16,16 @@ import random
 
 # Characteristics for logging
 num_clients = 30
-selection_rate = 1
+selection_rate = 0.5
 alpha = 0.1  # Dirichlet distribution parameter for non-IID
 repair_threshold = 0.8*selection_rate*num_clients  # Number of active clients below which we trigger minimal repair
 iid_type = "non-iid" if alpha < 1 else "iid"  # Characterize dataset
 algorithm = "fedavg"
 date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+# Hyperparameters
+learning_rate = 0.01
+num_rounds = 100  # Reduced number of rounds for optimization
+num_local_epochs = 1  # Reduced number of local epochs
 
 # Log file name format: includes date, algorithm, non-IID/IID type, and number of clients
 log_file_name = f"federated_learning_{algorithm}_{iid_type}_{num_clients}clients_{date_str}.txt"
@@ -206,11 +210,6 @@ class CIFAR10_ResNet(nn.Module):
         x = self.fc(x)
         return x
 
-# Hyperparameters
-learning_rate = 0.001
-num_rounds = 100  # Reduced number of rounds for optimization
-num_local_epochs = 5  # Reduced number of local epochs
-
 # FedAvg Algorithm to average the model weights modified for freezing layers
 def fed_avg_with_frozen_layers(global_model, client_updates, frozen_layers):
     """
@@ -229,45 +228,137 @@ def fed_avg_with_frozen_layers(global_model, client_updates, frozen_layers):
     global_model.load_state_dict(global_state)
     return global_model
 
-def update_stability(global_model, client_models, stability_dict, alpha=0.95):
+def update_stability_smooth(global_model, client_models, stability_dict, alpha=0.98):
+    """
+    Updates stability metrics with smoother moving averages.
+    
+    Args:
+        global_model (nn.Module): The global model.
+        client_models (list of dict): List of client update dictionaries.
+        stability_dict (dict): Dictionary to store stability metrics.
+        alpha (float): Smoothing factor for moving averages.
+        
+    Returns:
+        dict: Updated stability dictionary.
+    """
     if global_model is None:
         raise ValueError("Global model is None. Stability update cannot proceed.")
     
     for name, param in global_model.named_parameters():
         delta = torch.zeros_like(param.data)
-        for client_model in client_models:
-            delta += client_model[name] - param.data
-
+        for client_update in client_models:
+            if name in client_update:
+                delta += client_update[name].data - param.data
         delta /= len(client_models)
         abs_delta = torch.abs(delta)
-
-        # Update moving averages for mean and magnitude of weight updates
+    
         if name not in stability_dict:
-            stability_dict[name] = {'mean': delta, 'magnitude': abs_delta}
+            stability_dict[name] = {'mean': delta.clone(), 'magnitude': abs_delta.clone()}
         else:
             stability_dict[name]['mean'] = alpha * stability_dict[name]['mean'] + (1 - alpha) * delta
             stability_dict[name]['magnitude'] = alpha * stability_dict[name]['magnitude'] + (1 - alpha) * abs_delta
-
-        # Calculate stability index
+    
         ratio = torch.abs(stability_dict[name]['mean']) / (stability_dict[name]['magnitude'] + 1e-10)
         stability_dict[name]['stability'] = ratio.mean().item()
-
+    
     return stability_dict
 
-def apply_layer_freezing(stability_dict, frozen_layers, stability_threshold=0.1):
+def categorize_layers(model):
+    """
+    Categorizes layers based on their type.
+    
+    Args:
+        model (nn.Module): The model to categorize.
+        
+    Returns:
+        dict: Mapping from layer name to layer type.
+    """
+    layer_types = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            layer_types[name] = 'conv'
+        elif isinstance(module, nn.BatchNorm2d):
+            layer_types[name] = 'batchnorm'
+        elif isinstance(module, nn.Linear):
+            layer_types[name] = 'linear'
+        # Add more categories as needed
+    return layer_types
+
+def apply_layer_freezing_with_hysteresis_and_cooldown(stability_dict, frozen_layers, cooldown_counters, 
+                                                      freeze_threshold=0.7, unfreeze_threshold=0.8, 
+                                                      cooldown=3):
+    """
+    Freezes or unfrezes layers based on stability thresholds with hysteresis and cooldown to prevent oscillations.
+    
+    Args:
+        stability_dict (dict): Dictionary containing stability metrics for each layer.
+        frozen_layers (set): Set of currently frozen layer names.
+        cooldown_counters (dict): Dictionary tracking cooldown for each layer.
+        freeze_threshold (float): Threshold below which layers are frozen.
+        unfreeze_threshold (float): Threshold above which layers are unfrozen.
+        cooldown (int): Number of rounds to wait before changing layer state.
+        
+    Returns:
+        set: Updated set of frozen layer names.
+        dict: Updated cooldown counters.
+    """
     for name, metrics in stability_dict.items():
-        if metrics['stability'] < stability_threshold and name not in frozen_layers:
-            frozen_layers.add(name)  # Freeze this layer
-    return frozen_layers
+        stability = metrics.get('stability', 1.0)  # Default to stable if not present
+        
+        if name not in cooldown_counters:
+            cooldown_counters[name] = 0
+        else:
+            cooldown_counters[name] += 1
+        
+        if stability < freeze_threshold and name not in frozen_layers and cooldown_counters[name] >= cooldown:
+            frozen_layers.add(name)
+            cooldown_counters[name] = 0  # Reset cooldown
+            logging.info(f"Layer {name} has been frozen (stability: {stability:.4f}).")
+        
+        elif stability > unfreeze_threshold and name in frozen_layers and cooldown_counters[name] >= cooldown:
+            frozen_layers.remove(name)
+            cooldown_counters[name] = 0  # Reset cooldown
+            logging.info(f"Layer {name} has been unfrozen (stability: {stability:.4f}).")
+        
+        # If not meeting conditions, do not change state and cooldown continues
+    return frozen_layers, cooldown_counters
+
+def log_freezing_status(frozen_layers, stability_dict):
+    """
+    Logs the current freezing status of all layers.
+    
+    Args:
+        frozen_layers (set): Set of currently frozen layer names.
+        stability_dict (dict): Dictionary containing stability metrics for each layer.
+    """
+    logging.info("Current Freezing Status:")
+    for name, metrics in stability_dict.items():
+        status = "Frozen" if name in frozen_layers else "Active"
+        stability = metrics.get('stability', 1.0)
+        logging.info(f"Layer {name}: {status}, Stability: {stability:.4f}")
 
 def get_client_update(local_model, frozen_layers):
     return {name: param for name, param in local_model.state_dict().items() if name not in frozen_layers}
 
-def get_transmitted_data_size(model, frozen_layers):
+def get_transmitted_data_size(client_update, frozen_layers):
+    """
+    Calculates the size of the transmitted data based on the client update dictionary.
+
+    Args:
+        client_update (dict): A dictionary of parameter tensors from the client.
+        frozen_layers (set): A set of layer names that are frozen and should not be included.
+
+    Returns:
+        int: Total size of the transmitted data in bytes.
+    """
+    
+    if not isinstance(client_update, dict):
+        raise TypeError(f"Expected client_update to be a dict, but got {type(client_update)}")
+    
     transmitted_size = sum(
-        p.numel() * p.element_size() for name, p in model.named_parameters() if name not in frozen_layers
+        param.numel() * param.element_size() for name, param in client_update.items() if name not in frozen_layers
     )
-    return transmitted_size  # In bytes
+    return transmitted_size
 
 def train_client_with_freezing(client_loader, model, criterion, optimizer, frozen_layers, device):
     model.train()
@@ -331,13 +422,20 @@ logging.info(f"Starting federated learning with {num_clients} clients")
 stability_dict = {}
 frozen_layers = set()
 
+# Initialize cooldown counters
+cooldown_counters = {}
+
+# Categorize layers for prioritization (if implementing prioritized freezing)
+layer_types = categorize_layers(global_model)
+#frozen_layers.add("layer1.0.conv1.weight")  # or any param name from model.state_dict()
+
 for round in range(num_rounds):
     logging.info(f"Starting round {round + 1}")
     start_time = time.time()
 
     round_loss = []
     round_accuracy = []
-    client_models = []
+    client_updates = []
 
     # Step 1: Train active clients
     for client_id in selected_clients:
@@ -352,41 +450,50 @@ for round in range(num_rounds):
         round_loss.append(client_loss)
         round_accuracy.append(client_accuracy)
 
-        #Extract upates for unfrozen clients
+        # Extract updates for unfrozen layers
         client_update = get_client_update(local_model, frozen_layers)
         client_update_size = sum(param.numel() * param.element_size() for param in client_update.values())
-        logging.info(f"Client {client_id}: Transmitted {client_update_size / (1024 * 1024):.2f} MB")
+        logging.info(f"Client {client_id + 1}: Transmitted {client_update_size / (1024 * 1024):.2f} MB")
 
-        #Append client updates(not full models)
-        client_models.append(client_update)
+        # Append client updates
+        client_updates.append(client_update)
 
-    
     # Step 2: Aggregate models
-    # Aggregate models with frozen layers
-    if client_models:
-        global_model = fed_avg_with_frozen_layers(global_model, client_models, frozen_layers)
+    if client_updates:
+        global_model = fed_avg_with_frozen_layers(global_model, client_updates, frozen_layers)
     else:
         logging.warning("No client models received. Skipping aggregation.")
         continue  # Skip to the next round
 
-        #global_model_size = get_model_size(global_model)
-        #logging.info(f"Global model size after this round: {global_model_size / (1024 * 1024):.2f} MB")
-    
-    # Step 3: Update stability and apply freezing
-    if not client_models:
+    # Step 3: Update stability with smoothing
+    if not client_updates:
         logging.warning("No client models available for stability update.")
     else:
-        stability_dict = update_stability(global_model, client_models, stability_dict)
-    frozen_layers = apply_layer_freezing(stability_dict, frozen_layers)
-    
+        stability_dict = update_stability_smooth(global_model, client_updates, stability_dict, alpha=0.98)
+
+    # Apply layer freezing with hysteresis and cooldown
+    frozen_layers, cooldown_counters = apply_layer_freezing_with_hysteresis_and_cooldown(
+        stability_dict, frozen_layers, cooldown_counters, 
+        freeze_threshold=0.15, 
+        unfreeze_threshold=0.25, 
+        cooldown=5
+    )
+    logging.info(f"Round {round+1} - Currently frozen layers: {frozen_layers}")
+    print(f"Round {round+1} - Currently frozen layers: {frozen_layers}")
+
+    # Log current freezing status
+    log_freezing_status(frozen_layers, stability_dict)
+
     # Step 4: Evaluate model
     test_accuracy = evaluate_model(test_loader, global_model, device)
     logging.info(f"Test Accuracy after round {round + 1}: {test_accuracy:.2f}%")
-    
+
     elapsed_time = time.time() - start_time
     logging.info(f"Round {round + 1} completed in {elapsed_time:.2f} seconds\n")
-    total_round_data = sum(get_transmitted_data_size(client_model, frozen_layers) for client_model in client_models)
+
+    # Calculate total data transmitted in this round
+    total_round_data = sum(get_transmitted_data_size(client_update, frozen_layers) for client_update in client_updates)
     logging.info(f"Total data transmitted in round {round + 1}: {total_round_data / (1024 * 1024):.2f} MB")
 
 
-logging.info("Federated learning process finished successfully.")
+logging.info("Federated learning process finished successfully.")  
