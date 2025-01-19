@@ -40,8 +40,8 @@ Other standard libraries used include `argparse`, `logging`, etc.
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/federated_learning_project.git
-   cd federated_learning_project
+   git clone https://github.com/Twinte/Layer-Freezing-in-FL.git
+   cd Layer-Freezing-in-FL
    ```
 
 2. **Create a virtual environment and install dependencies:**
