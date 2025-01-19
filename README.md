@@ -1,4 +1,3 @@
-```markdown
 # Federated Learning with Concept Drift Simulation
 
 This repository implements a **Federated Learning (FL)** simulation using the CIFAR-10 dataset. It features:
