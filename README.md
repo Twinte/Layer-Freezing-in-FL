@@ -118,6 +118,3 @@ python main.py --enable_concept_drift \
 ## License
 
 This project is licensed under the MIT License.
-```
-
-You can place the above content into a file named `README.md` in the root of your repository. This README provides a brief explanation of the project, its features, and instructions on how to run and experiment with the FL simulation.
